@@ -211,3 +211,59 @@ it provides information about how much to change, or fluctuate, our initial outc
 ### Step 4: Update the **Initial Estimates of the Expected Outcome**
 
 Key Idea: **update our initial outcome estimates** from Step 1 using information from Step 2 and 3 to obtain the correct bias-variance tradeoff for the ATE
+
+-   Intuition & Review: We first initialize the estimate of outcome (Q function) and want to update it.
+
+    -   To update, we first define a `clever coveriate` (Step 2, use inverse probability as the weighting), and use such item as the information of treatment mechanism
+
+    -   In step 3, we then estimate the EIF (efficient influence function), and the fluctuation parameter. What we obtained in the previous steps are essential update (i.e. step 4)
+
+**Step 3**: The estimated EIF and $\epsilon$ are in the logit scale.
+
+So first do `logit` transform for the initialized expected outcome
+
+Do Update:
+
+$$
+logit(\hat{E}^*(Y|A,\mathbf{W}))=logit(\hat{E}(Y|A,\mathbf{W}))+\hat{\epsilon}H(A,\mathbf{W})
+$$
+
+Then transform back:
+
+$$
+\hat{E}^*(Y|A,\mathbf{W})=expit(logit(\hat{E}(Y|A,\mathbf{W}))+\hat{\epsilon}H(A,\mathbf{W}))
+$$
+
+**Update the expected outcomes of all observations, given the treatment they actually received and their baseline confounders.**
+
+```{r}
+H_A <- dat_tmle$H_A # for cleaner code in Q_A_update
+Q_A_update <- plogis(qlogis(Q_A) + eps*H_A)
+
+Q_1_update <- plogis(qlogis(Q_1) + eps*H_1) #Update the expected outcomes, conditional on baseline confounders and everyone receiving the treatment. E(Y|A=1,W)
+
+Q_0_update <- plogis(qlogis(Q_0) + eps*H_0)#Update the expected outcomes, conditional on baseline confounders and no one receiving the treatment. E(Y|A=0,W)
+```
+
+### Step 5: Compute the estimate of ATE
+
+```{r}
+tmle_ate <- mean(Q_1_update - Q_0_update)
+tmle_ate
+```
+
+## Using `tmle` Package instead 
+
+```{r}
+library(sl3)
+tmle_fit <-
+  tmle::tmle(Y = Y, # outcome vector
+           A = A, # treatment vector
+           W = W, # matrix of confounders W1, W2, W3, W4
+           Q.SL.library = sl_libs, # superlearning libraries from earlier for outcome regression Q(A,W)
+           g.SL.library = sl_libs) # superlearning libraries from earlier for treatment regression g(W)
+
+tmle_fit
+
+
+```
