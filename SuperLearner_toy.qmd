@@ -224,7 +224,7 @@ washb_task <- make_sl3_Task(
 
 -   Side note: a `task` in `sl3` means the object we want to use to fit a statistical model
 
--    each learner starts with `Lrnr` and seems to correspond to a package in `R`.
+-   each learner starts with `Lrnr` and seems to correspond to a package in `R`.
 
 ```{r}
 #Choose the base learners
@@ -450,7 +450,7 @@ folds <- folds_rolling_window(
 
 extended to support multiple time-series with arbitrary sample-level dependence by incorporating a $V$-fold splitting component
 
-##### Pipeline for computing CV 
+##### Pipeline for computing CV
 
 -   Define fold object: `make_folds(data, fun=)` returns a folds object, fun refers to the CV scheme we discussed before; make_folds function can support a variety of cross-validation schemes
 
@@ -484,6 +484,7 @@ extended to support multiple time-series with arbitrary sample-level dependence 
 
     # function to calculate cross-validated squared error
     cv_forecasts <- function(fold, data) {
+      #fold: a fold object
       # Get training and validation data
       train_data <- training(data)
       valid_data <- validation(data)
@@ -523,4 +524,241 @@ extended to support multiple time-series with arbitrary sample-level dependence 
 
     ```
 
+    ```{r}
+    mses <- cross_validate(
+      cv_fun = cv_forecasts, folds = folds, data = AirPassengers,
+      use_future = FALSE
+    )
+    ```
+
+```{r}
+mses$mse
+```
+
+## Parallel Processing in sl3
+
+Using `future` Package, dont need to modify any code in order switch from sequential on the local machine to distributed processing on a remote compute cluster. And global variables and functions are automatically identified and exported as needed, making it straightforward to tweak existing code to make use of futures.”
+
+Example:
+
+```{r}
+library(polspline)
+task <- make_sl3_Task(
+  data = washb_data,
+  outcome = "whz",
+  covariates = c("tr", "fracode", "month", "aged", "sex", "momage", "momedu", 
+                 "momheight", "hfiacat", "Nlt18", "Ncomp", "watmin", "elec", 
+                 "floor", "walls", "roof", "asset_wardrobe", "asset_table", 
+                 "asset_chair", "asset_khat", "asset_chouki", "asset_tv", 
+                 "asset_refrig", "asset_bike", "asset_moto", "asset_sewmach", 
+                 "asset_mobile")
+)
+lrn_glm<-Lrnr_glm$new() #Lrnr_glm is a R6class, and lrnr_glm. is a new object which contain several properties
+lrn_mean <- Lrnr_mean$new()
+# penalized regressions:
+lrn_ridge <- Lrnr_glmnet$new(alpha = 0)
+lrn_lasso <- Lrnr_glmnet$new(alpha = 1)
+# spline regressions:
+lrn_polspline <- Lrnr_polspline$new()
+lrn_earth <- Lrnr_earth$new()
+
+# fast highly adaptive lasso (HAL) implementation
+lrn_hal <- Lrnr_hal9001$new(max_degree = 2, num_knots = c(3,2), nfolds = 5)
+
+# tree-based methods
+lrn_ranger <- Lrnr_ranger$new()
+lrn_xgb <- Lrnr_xgboost$new()
+lrn_gam <- Lrnr_gam$new()
+lrn_bayesglm <- Lrnr_bayesglm$new()
+
+#Put all learners together so SL could consider them as candicates
+stack <- Stack$new(
+  lrn_glm, lrn_mean, lrn_ridge, lrn_lasso, lrn_polspline, lrn_earth, lrn_hal, 
+  lrn_ranger, lrn_xgb, lrn_gam, lrn_bayesglm
+)
+#Stack is also a class(or say, a learner itself) and we create a stack object using a template
+
+#INstantiate the SL with stacked learners and metalearner
+sl <- Lrnr_sl$new(learners = stack, metalearner = Lrnr_nnls$new())
+#sl is an object, 
+set.seed(4197)
+sl_fit <- sl$train(task = task)
+
+runtime_sl_fit <- proc.time() - start_time # end time - start time = run time
+runtime_sl_fit #167.36s
+```
+
+```{r}
+library(future)
+ncores <- availableCores()-1
+plan(multicore, workers = ncores)
+start_time <- proc.time()
+
+set.seed(4197)
+sl_fit_parallel <- sl$train(task)
+runtime_sl_fit_parallel <- proc.time() - start_time
+runtime_sl_fit_parallel #161.61s
+```
+
+## Tuning Parameters in SL
+
+### Define your own model configurations
+
+```{r}
+grid_params <- list(
+  max_depth = c(3, 5, 8),
+  eta = c(0.001, 0.1, 0.3),
+  nrounds = 100
+)
+grid <- expand.grid(grid_params, KEEP.OUT.ATTRS = FALSE)
+
+xgb_learners <- apply(grid, MARGIN = 1, function(tuning_params) {
+  do.call(Lrnr_xgboost$new, as.list(tuning_params))
+})
+```
+
+### Automatically grid and selection with Caret
+
+```{r}
+library(caret)
+lrnr_nnet_autotune <- Lrnr_caret$new(method = "nnet", name = "NNET_autotune")
+```
+
 ## SuperLearner in Time Series Analysis
+
+Review: How to fit a SL?
+
+-   Define the prediction task with `make_sl3_task`
+
+-   Instantiate the SL with `Lrnr_sl`
+
+-   Fit the SL to the task with `train`
+
+```{r}
+set.seed(49753)
+
+library(data.table)
+library(origami)
+library(sl3)
+library(xts)
+
+# load data
+data(bsds)
+head(bsds)
+
+#Create a time-series object:
+tsdata<-xts(bsds$cnt, order.by=as.POSIXct(bsds$dteday))
+
+#Visualize the time-series:
+PerformanceAnalytics::chart.TimeSeries(tsdata, auto.grid = FALSE, main = "Count of total rental bikes")
+
+```
+
+First do cross_validation to fit the metalearner.
+
+```{r}
+#Rolling origin:
+folds = origami::make_folds(tsdata, fold_fun=folds_rolling_origin, first_window = 10, validation_size = 10, gap = 0, batch = 1)
+
+#We can also specify how far in the future we want to train our model on.And increase the training size in each fold
+folds = origami::make_folds(tsdata, fold_fun=folds_rolling_origin, first_window = 10, validation_size = 10, gap = 5, batch = 10)
+folds[[1]]
+folds[[2]]
+
+#Rolling window:
+folds = origami::make_folds(tsdata, fold_fun=folds_rolling_window, window_size = 10, validation_size = 10, gap = 0, batch = 1)
+folds[[1]]
+folds[[2]]
+
+#Final setup
+folds = origami::make_folds(tsdata, fold_fun=folds_rolling_window, window_size = 50, validation_size = 30, gap = 0, batch = 50)
+```
+
+To use this data set with `sl3`, the object must be wrapped in a customized `sl3` container, an **`sl3` "Task"** object. A *task* is an idiom for all of the elements of a prediction problem other than the learning algorithms and prediction approach itself -- that is, a task delineates **the structure of the data set of interest and any potential metadata** (e.g., observation-level weights).
+
+```{r}
+covars <- "cnt"
+outcome <- "cnt"
+
+# create the sl3 task and take a look at it
+ts_uni_task <- sl3_Task$new(data = bsds, covariates = covars,
+                        outcome = outcome, outcome_type = "continuous", folds=folds)
+
+# let's take a look at the sl3 task
+ts_uni_task
+
+# specify how far out we're going to predict on this univariate time series
+n_ahead_param <- 2
+```
+
+### Defining `sl3` learners
+
+`Lrnr_base` : a base class for defining machine learning algorithms, as well as fits for those algorithms to particular `sl3_task` . Different machine learning algorithms are defined in classes that inherit from `Lrnr_base`. All learners (e.g., `Lrnr_arima`) inherit from this R6 class.
+
+Therefore, "learners" in `sl3` refer to the family of classes that inherit from `Lrnr_base` . A `learner` **Object** can be constructed from their class definitions using the `make_learner` function (or just use `Lrnr_xxx$new()` method)
+
+```{r}
+#A naive example
+lrnr_arima <- Lrnr_arima$new(n.ahead = n_ahead_param)
+```
+
+All learners define three main methods: `train`, `predict`, and `chain`. The first, `train`, takes an `sl3_task` object, and returns a `learner_fit`, which has the same class as the learner that was trained:
+
+```{r}
+fit_arima <- lrnr_arima$train(ts_uni_task)
+
+# verify that the learner is fit
+fit_arima$is_trained
+
+# get learner predictions
+pred_arima <- fit_arima$predict()
+head(pred_arima)
+```
+
+### Pipeline vs. Stack
+
+The `Pipeline` class automates this process. It takes an arbitrary number of learners and fits them sequentially, training and chaining each one in turn. Since `Pipeline` is a learner like any other, it shares the same interface. We can define a pipeline using `make_learner`, and use `train` and `predict` just as we did before
+
+Like `Pipelines`, `Stacks` combine multiple learners. Stacks train learners simultaneously, so that their predictions can be either combined or compared.
+
+```{r}
+lrnr_tsdyn_linear <- Lrnr_tsDyn$new(learner = "linear", m = 1,
+                                    n.ahead = n_ahead_param)
+lrnr_tsdyn_setar <- Lrnr_tsDyn$new(learner = "setar", m = 1, model = "TAR",
+                                   n.ahead = n_ahead_param)
+lrnr_tsdyn_lstar <- Lrnr_tsDyn$new(learner = "lstar", m = 1,
+                                   n.ahead = n_ahead_param)
+lrnr_garch <- Lrnr_rugarch$new(n.ahead = n_ahead_param)
+lrnr_expsmooth <- Lrnr_expSmooth$new(n.ahead = n_ahead_param)
+lrnr_harmonicreg <- Lrnr_HarmonicReg$new(n.ahead = n_ahead_param, K = 7,
+                                         freq = 105)
+```
+
+```{r ts_stack_example}
+ts_stack <- Stack$new(lrnr_arima, lrnr_tsdyn_linear, lrnr_tsdyn_setar,
+                      lrnr_tsdyn_lstar)
+ts_stack_fit <- ts_stack$train(ts_uni_task)
+ts_stack_preds <- ts_stack_fit$predict() #prediction on validation set
+head(ts_stack_preds)
+```
+
+### Cross-Validation in model fitting
+
+```{r cv_ts_example}
+#| message: false
+#| warning: false
+cv_ts_stack <- Lrnr_cv$new(ts_stack) #Fit/Predict a learner with Cross Validation
+cv_ts_fit <- cv_ts_stack$train(ts_uni_task) #train on the whole dataset
+cv_ts_preds <- cv_ts_fit$predict()
+```
+
+```{r}
+risks <- cv_ts_fit$cv_risk(loss_squared_error)
+print(risks)
+```
+
+```{r}
+metalearner <- make_learner(Lrnr_nnls)
+cv_ts_uni_task <- cv_ts_fit$chain()
+ts_ml_fit <- metalearner$train(cv_ts_uni_task) #metalearner is trained on validation set
+```

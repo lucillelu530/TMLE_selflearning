@@ -7,10 +7,16 @@ The expected structure of this tutorial is:
 (d) Introduction for SuperLearner
 (e) Theorectical foundation(eg. semiparametric, efficient theory etc.)
 
-Finished: (a) ~ (c)
+Finished: (a) ~ (d)
+
+For (d), a study guide for the use of `sl` in time series: https://github.com/tlverse/sl3_lecture/blob/master/sl3_timeseries.Rmd
+
 
 ### To DO List
 
-(d) SuperLearner (Extension: Online Superlearner)
+1. Extension of OnlineSuperLearner
+2. Dynamic and Optimal Individualized Treatment Regimes
+
+
 
 
