@@ -252,7 +252,7 @@ tmle_ate <- mean(Q_1_update - Q_0_update)
 tmle_ate
 ```
 
-## Using `tmle` Package instead 
+## Using `tmle` Package instead
 
 ```{r}
 library(sl3)

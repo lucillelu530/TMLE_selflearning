@@ -1,0 +1,526 @@
+---
+title: "Superlearner_toy"
+format: html
+editor: visual
+---
+
+## Intuition of SuperLearner
+
+Brief words: some knid of like **Stacking**, weights the results of many individual statistical learning algorithms and then create an optimal overall prediction.
+
+-   Combining many individual learners often like "data-adaptive" or "machine learning" algorithms which is to create a new and single prediction algorithm. This is expected to perform at least as well as any of the individual algorithms
+
+-   SuperLearner algorithm decide how to combine or weight the individual algorithms based on how well each one minimizes a specified loss function.
+
+    -   Other names: **Stacking, stacked generalizations, weighted ensembling**
+
+-   **Ensembling**: A mix of multiple algorithms maybe more optimal for given datasets
+
+## Toy Example
+
+```{r}
+library(tidyverse)
+library(gt)
+set.seed(7)
+#Initial setup: simulate data
+n <- 5000
+obs <- tibble(
+  id = 1:n,
+  x1 = rnorm(n),
+  x2 = rbinom(n, 1, plogis(10*x1)),
+  x3 = rbinom(n, 1, plogis(x1*x2 + .5*x2)),
+  x4 = rnorm(n, mean=x1*x2, sd=.5*x3),
+  y = x1 + x2 + x2*x3 + sin(x4)
+)
+gt(head(obs)) %>%
+  tab_header("Simulated data set") %>%
+  fmt_number(everything(),decimals=3)
+```
+
+### Step1: K-folds split
+
+`sl` relies on k-flod CV to avoid overfitting
+
+```{r}
+k<-10
+cv_index<-sample(rep(1:k,each=n/k)) #first repeat, then permute(shuffle)
+```
+
+### Step 2: Fit base learners for first CV-fold
+
+In each loop (1:10 in this case), one fold will serve as validation set and the other 9 is the training set
+
+```{r}
+cv_train_1 <- obs[-which(cv_index == 10),] # make a data set that contains all observations except those in k=1
+fit_1a <- glm(y ~ x2 + x4, data=cv_train_1) # fit the first linear regression on that training data
+fit_1b <- glm(y ~ x1 + x2 + x1*x3 + sin(x4), data=cv_train_1) # second LR fit on the training data
+fit_1c <- glm(y ~ x1*x2*x3, data=cv_train_1) # and the third LR
+
+```
+
+### Step 3: Obtain predictions for the first CV-fold
+
+```{r}
+cv_valid_1 <- obs[which(cv_index == 10),] # make a data set that only contains observations except in k=10
+pred_1a <- predict(fit_1a, newdata = cv_valid_1) # use that data set as the validation for all the models in the SL library
+pred_1b <- predict(fit_1b, newdata = cv_valid_1) 
+pred_1c <- predict(fit_1c, newdata = cv_valid_1)
+```
+
+### Step 4: Obtain CV Predictions for the entire dataset
+
+```{r}
+cv_folds <- as.list(1:k)
+names(cv_folds) <- paste0("fold",1:k)
+
+get_preds <- function(fold){   # function that does the same procedure as step 2 and 3 for any CV fold
+  cv_train <- obs[-which(cv_index == fold),]  # make a training data set that contains all data except fold k
+  fit_a <- glm(y ~ x2 + x4, data=cv_train)  # fit all the base learners to that data
+  fit_b <- glm(y ~ x1 + x2 + x1*x3 + sin(x4), data=cv_train)
+  fit_c <- glm(y ~ x1*x2*x3, data=cv_train)
+  cv_valid <- obs[which(cv_index == fold),]  # make a validation data set that only contains data from fold k
+  pred_a <- predict(fit_a, newdata = cv_valid)  # obtain predictions from all the base learners for that validation data
+  pred_b <- predict(fit_b, newdata = cv_valid)
+  pred_c <- predict(fit_c, newdata = cv_valid)
+  return(data.frame("obs_id" = cv_valid$id, "cv_fold" = fold, pred_a, pred_b, pred_c))  # save the predictions and the ids of the observations in a data frame
+}
+
+cv_preds <- purrr::map_dfr(cv_folds, ~get_preds(fold = .x)) # map_dfr loops through every fold (1:k) and binds the rows of the listed results together
+
+cv_preds %>% arrange(obs_id) %>% head() %>% as.data.frame() %>% gt() %>%
+  fmt_number(cv_fold:pred_c, decimals=2) %>%
+  tab_header("All CV predictions for all three base learners") 
+```
+
+-   Side note: `purr::map_dfr` is equivalent to :
+
+    ```{r}
+    cv_preds <- dplyr::bind_rows(lapply(cv_folds, function(f) get_preds(fold = f)))
+    ```
+
+### Step 5: Compute loss function of interest via metalearner
+
+Brief words for **Metalearner** : `metalearner` is used to take information from all of the base learners and create that new algorithm
+
+```{r}
+obs_preds <- 
+  full_join(obs, cv_preds, by=c("id" = "obs_id")) #full_join(x,y): add columns from y to x, matching observations based on the keys
+```
+
+**Something need to keep in mind** : the predictors will always to be the cross-validated predictions from each base learner, and the outcome will always be the true outcome.
+
+```{r}
+sl_fit <- glm(y ~ pred_a + pred_b + pred_c, data = obs_preds) #metalearner
+broom::tidy(sl_fit) %>% gt() %>%
+  fmt_number(estimate:p.value, decimals=2) %>%
+  tab_header("Metalearner regression coefficients") 
+```
+
+This metalearner provides us with the coefficients, or weights, to apply to each of the base learners. In other words, if we have a set of predictions from Learner A, B, and C, we can obtain our best possible predictions by starting with an intercept of -0.003, then adding -0.017 predictions from Learner A, 0.854 predictions from Learner B, and 0.165 predictions from Learner C
+
+### Step 6: fit base learners and obtain predictions based on entire dataset
+
+**Keep in mind the difference** : We first use cross-validation to fit learners to avoid overfitting
+
+-   We first cross-validation to fit base learners is to **generate *out-of-fold predictions*** from each base learner, and those **CV predictions are what the meta-learner is trained on**.
+
+-   MetaLearner will give the coefficient (ie. weight) for each base learner
+
+-   Once the weight is obtained, SuperLearner refits each base learner on the **full dataset** and combines them using the learned **weights**
+
+```{r}
+fit_a <- glm(y ~ x2 + x4, data=obs)
+fit_b <- glm(y ~ x1 + x2 + x1*x3 + sin(x4), data=obs)
+fit_c <- glm(y ~ x1*x2*x3, data=obs)
+pred_a <- predict(fit_a)
+pred_b <- predict(fit_b)
+pred_c <- predict(fit_c)
+full_data_preds <- tibble(pred_a, pred_b, pred_c)
+```
+
+Then use the metalearner fit to weight base learners
+
+```{r}
+sl_predictions <- predict(sl_fit, newdata = full_data_preds) #use meta learner to fit the full predictions
+data.frame(sl_predictions = head(sl_predictions)) %>%
+  gt() %>% fmt_number(sl_predictions, decimals=2) %>%
+tab_header("Final SL predictions (manual)") 
+```
+
+### Step 7: Obtain predictions on new data
+
+```{r}
+new_obs <- tibble(x1 = .5, x2 = 0, x3 = 0, x4 = -3)
+#fit separately on base learners
+new_pred_a <- predict(fit_a, new_obs)
+new_pred_b <- predict(fit_b, new_obs)
+new_pred_c <- predict(fit_c, new_obs)
+new_pred_df <- tibble("pred_a" = new_pred_a, "pred_b" = new_pred_b, "pred_c" = new_pred_c)
+# use new predictions on meta learners
+predict(sl_fit, newdata = new_pred_df)
+```
+
+-   Side note: we could write functions to tune these algorithms’ hyperparameters over various grids. For example, if we were to include random forest in our library, we may want to tune over a number of trees and maximum bucket sizes.
+
+    We can then cross-validate this entire process to evaluate the predictive performance of our superlearner algorithm. Alternatively, we could leave a hold-out training data set to evaluate the performance.
+
+## Using Package
+
+### `SuperLearner`
+
+```{r}
+library(SuperLearner)
+x_df <- obs %>% select(x1:x4) %>% as.data.frame()
+sl_fit <- SuperLearner(Y = obs$y, X = x_df, family = gaussian(),
+                     SL.library = c("SL.ranger", "SL.glmnet", "SL.earth"))
+#can specify the metalearner in `method` argument, by default method="NNLS"
+```
+
+```{r}
+sl_fit
+#Cross-validated Risk(loss function) and coefficient (weights) are given to each model
+head(data.frame(sl_predictions = sl_fit$SL.predict)) %>% gt() %>%
+  fmt_number(everything(),decimals=2) %>% tab_header("Final SL predictions (package)") #Obtain final predictions
+```
+
+```{r}
+cv_sl_fit <- CV.SuperLearner(Y = obs$y, X = x_df, family = gaussian(),
+                     SL.library = c("SL.ranger", "SL.glmnet", "SL.earth"))
+```
+
+`CV.SuperLearner` runs the cross-validated SuperLearner and give out-of-fold predictions as well as CV risk for each learner and for the ensemble
+
+```{r}
+head(cv_sl_fit$SL.predict) #out of fold risk from the ensemble
+#cv_sl_fit$cvRisk # CV risk
+#cv_sl_fit$folds use to see the fold assignments
+
+
+```
+
+### `sl3`
+
+```{r}
+library(sl3)
+library(gt)
+set.seed(7)
+washb_data <- read.csv("https://raw.githubusercontent.com/tlverse/tlverse-data/master/wash-benefits/washb_data.csv")
+gt(head(washb_data))
+```
+
+```{r}
+outcome <- "whz"
+covars <- washb_data %>%
+  select(-whz) %>%
+  names()
+
+#make an sl3 task
+washb_task <- make_sl3_Task(
+  data = washb_data,
+  covariates = covars,
+  outcome = outcome
+)
+```
+
+-   Side note: a `task` in `sl3` means the object we want to use to fit a statistical model
+
+-    each learner starts with `Lrnr` and seems to correspond to a package in `R`.
+
+```{r}
+#Choose the base learners
+stack <- make_learner_stack(
+  "Lrnr_randomForest", 
+  "Lrnr_gbm",
+  "Lrnr_glm"
+) #all use default learners
+
+metalearner <- make_learner(Lrnr_glm)
+
+#Create a SuperLearner object
+sl <- make_learner(Lrnr_sl, 
+                   learners = stack,
+                   metalearner = metalearner)
+```
+
+-   Side note: `make_learner_stack()` is to create a stack of default base learners.
+
+-   `Lrnr_sl()` takes the CV predictions from the base models and use them to predict the true outcome (i.e. train the metalearner on CV predictions from the base learner, then forms the final ensemble model)
+
+    -   CV to get **out-of-fold predictions** from each base learner
+
+    -   Fit metalearner using those CV predictions
+
+    -   Refit base learners on full data + combine
+
+```{r}
+sl_fit <- sl$train(washb_task) #train superlearner based on the task object
+```
+
+```{r}
+# a learner or pipeline contains a function that captures a huge environment (e.g., training data stored inside, or something saved in a closure). When future tries to export it, it becomes massive.
+library(future)
+plan(sequential)
+options(future.globals.maxSize = 2 * 1024^3)  # 2 GB
+sl_fit$print() %>% gt()
+
+```
+
+```{r}
+##look at the prediction
+sl_fit$predict(washb_task) %>% head()
+```
+
+#### Cross-validate the ensembled sl using `origami`
+
+`origami` is a cross-validation package
+
+-   can use make_learner to customize the tuning parameters of base learners or metalearners
+
+    ```{r}
+    lrnr_RF_200trees <- make_learner(Lrnr_randomForest,ntree=200)
+    ```
+
+#### Identifications in `sl3`
+
+Review concepts about `R6class` and `object` 梦回c++...
+
+It should be kept in mind that `sl3` (and `tlverse` ) is built based on OOP (Object oritented programming) principles and the `R6` OOP framework. So learning about some concepts about OOP and how the `tlverse` is structured would be helpful
+
+##### OOP Basics: Classes, Fields and Methods
+
+-   **Object** : A collection of data and function that corresponds to some conceptual unit
+
+    -   fields: can be thought of as nouns, are information about an object
+
+    -   methods: verbs, actions an object can perform
+
+    -   In R, methods and fields are accessed using `$` operator in `R6class`
+
+-   **Class**: a template for creating object
+
+    -   **objects are members of classes**
+
+    -   Classes can inherit elements from other classes
+
+##### Tips in sl3 (Functions, classes and objects)
+
+-   Function: `make_learner` \[input:class, output: object; indeed **make_learner is a factory function**\]
+
+-   Class: `Lrnr_xxxx` \[i.e. Learners are class, or say, model templates\]; Stack
+
+-   Object (can train/predict/predict): can use `$` operator.
+
+#### Origami and cross-validation
+
+**Objective of Cross-validation** : evaluate the quality of our estimation procedure’s performance; i.e. estimate the true performance(risk( of estimator.
+
+This part aims to test different cross-validation schemes
+
+```{r}
+library(data.table)
+library(origami)
+library(knitr)
+library(dplyr)
+
+# load data set and take a peek
+washb_data <- fread(
+  paste0(
+    "https://raw.githubusercontent.com/tlverse/tlverse-data/master/",
+    "wash-benefits/washb_data.csv"
+  ),
+  stringsAsFactors = TRUE
+)
+#Each row in the data represents an independent sample
+```
+
+##### Cross-validation for i.i.d data
+
+-   Re-substitution
+
+All observed data units are used in both the training and validation set. In `Re-substituion` method, we need to specify the total number of sampled units that we want to allocate to the training and validation sets.
+
+```{r}
+folds <- folds_resubstitution(nrow(washb_data))
+folds
+```
+
+**Every observation is used for training AND evaluation** (same data). So it’s basically a **1-fold CV where train = full data, validation = full data**.
+
+-   Hold-out
+
+Randomly dividing the available data into training and validation (holdout) sets. The model is then fitted (i.e., “trained”) using the observations in the training set and subsequently evaluated (i.e., “validated”) using the observations in the validation set.
+
+-   Leave one out
+
+Only one observation is used as the validation set. SO it would be less biased but highly computational expensive
+
+```{r}
+folds <- folds_loo(nrow(washb_data))
+```
+
+-   V-fold
+
+This cross-validation scheme randomly divides the dataset into V splits of equal (or approximately equal) size. For each split $v=1,…,V$, the $vth$ fold is defined by the \$vth \$split (which defines the validation set for fold v) and the complement of the vth split (which defines the training set for fold v). The algorithms are fit V times separately, to each of the V training sets.
+
+The cross-validated risk for a fitted algorithm, for example the MSE, is its average risk across all folds.
+
+The Super Learner algorithm relies on V-fold cross-validation as its default cross-validation scheme.
+
+```{r}
+folds <- folds_vfold(nrow(washb_data), V = 2) ##get two folds, each with approximately n/2 sampled units in the training and validation sets.
+```
+
+-   Monte-Carlo
+
+randomly select some fraction of the data, *without replacement*, to form the training set, assigning the remainder of the sampled units to the validation set. By repeating this procedure many times, the Monte Carlo cross-validation scheme generates, at random, many training and validation partitions of the dataset.
+
+**Same obs units might appear in the validation set multiple times**
+
+-   Bootstrap
+
+the bootstrap cross-validation scheme also consists of randomly selecting sampled units, *with replacement*, for the training set; the rest of the sampled units are allocated to the validation set. This process is then repeated multiple times, generating (at random) new training and validation partitions of the dataset each time.
+
+##### Cross-validation for Time-Series Data
+
+```{r}
+library(ggfortify)
+
+data(AirPassengers)
+AP <- AirPassengers
+
+autoplot(AP) +
+  labs(
+    x = "Date",
+    y = "Passenger numbers (1000's)",
+    title = "Air Passengers from 1949 to 1961"
+  )
+
+t <- length(AP)
+```
+
+-   Rolling Origin
+
+The rolling origin cross-validation scheme lends itself to “online” learning algorithms, in which large streams of data have to be fit continually (respecting time), where the fit of the learning algorithm is (constantly) updated as more data accrues.
+
+Key words: Train on the past, test on the future, and give a window (i.e. lag) between train and validation. From ith fold to (i+1) fold, the train set would be extended, while the validation set is still the same size.
+
+Each fold expands the training set forward:
+
+Fold 1 - Train: $1,\ldots,t_1$ - Test: $t_1+h,\ldots,t_{11}$
+
+Fold 2 - Train: $1,\ldots,t_2$ - Test: $t_2+h,\ldots,t_{22}$
+
+Fold 3 - Train: $1,\ldots,t_3$ - Test: $t_3+h,\ldots,t_{33}$
+
+**Visualization**
+
+```{r}
+folds <- folds_rolling_origin(
+  n = t,
+  first_window = 50, validation_size = 10, gap = 5, batch = 20
+)
+#n: number of time points we want to estimate
+#first_window: size of the first training set 
+#validation_size: size of validation size
+# gap: gap between training and validation
+#batch: size of the training set update per iteration of cross-validation
+folds[[1]]
+```
+
+-   Rolling window
+
+"Rolls" the training sample forward in time by m units(time). It is computationally more efficient. The sampled units in the training set are always the same for each iteration of the rolling window scheme.
+
+An easy example: Assume we use rolling window cross-validation using three time-series folds. The first window size is 15 time points, on which we first train the candidate learning algorithm. As in the previous illustration, we evaluate its performance on 10 time points, with a gap of size 5 time points between the training and validation sets. However, for the next fold, we train the learning algorithm on time points further away from the origin (here, 10 time points). Note that the size of the training set in the new fold is the same as in the first fold (both include 15 time points). This setup keeps the training sets comparable over time (and across folds), unlike under the rolling origin cross-validation scheme. We then evaluate the performance of the candidate learning algorithm on 10 time points in the future.
+
+```{r}
+folds <- folds_rolling_window(
+  n = t,
+  window_size = 50, validation_size = 10, gap = 5, batch = 20
+)
+#Window_size: the size of training dataset
+# gap,batch, validation size: same as rooling origin
+```
+
+-   Rolling origin with V fold
+
+**Integrating V-fold cross-validation within the time-series setup**. Will be used for multiple time points.
+
+-   Rolling window with V-fold
+
+extended to support multiple time-series with arbitrary sample-level dependence by incorporating a $V$-fold splitting component
+
+##### Pipeline for computing CV 
+
+-   Define fold object: `make_folds(data, fun=)` returns a folds object, fun refers to the CV scheme we discussed before; make_folds function can support a variety of cross-validation schemes
+
+    -   "training" index vector
+
+    -   validation index vector
+
+    -   fold_index
+
+-   Define the fold function: The `cv_fun` argument to [`cross_validate()`](http://tlverse.org/origami/reference/cross_validate.html) is a custom function that performs some operation on each fold (again, *usually* this specifies the training of the candidate learning algorithm and its evaluation on a given training/validation split, i.e., in a single fold). Within this function, the convenience functions [`training()`](http://tlverse.org/origami/reference/fold_helpers.html), [`validation()`](http://tlverse.org/origami/reference/fold_helpers.html) and [`fold_index()`](http://tlverse.org/origami/reference/fold_helpers.html) can be used to return the various components of a fold object. When the [`training()`](http://tlverse.org/origami/reference/fold_helpers.html) or [`validation()`](http://tlverse.org/origami/reference/fold_helpers.html) functions are passed an object of a particular class, they will index that object in a sensible way
+
+    -   The fold function must return a named `list` of results containing whatever fold-specific outputs are desired.
+
+-   Apply `cross_validate():` map the `cv_fun()` across the `folds` , internally, this uses either [`lapply()`](https://rdrr.io/r/base/lapply.html) or `future_lapply()` (a parallelized variant of the same). In this way, [`cross_validate()`](http://tlverse.org/origami/reference/cross_validate.html) can be easily parallelized by specifying a parallelization scheme. i.e. a `plan` from `future` package
+
+    ##### Example
+
+    ```{r}
+    #CV with Arima
+    data(AirPassengers)
+    # Suppose we want to pick between two forecasting models with different ARIMA (AutoRegressive Integrated Moving Average) model configurations.
+
+    folds <- make_folds(AirPassengers,
+      fold_fun = folds_rolling_origin, #Cross Validation Scheme
+      first_window = 36, validation_size = 24, batch = 10
+    )#increase the size of the training set by 10 points in each iteration (so that we don’t have so many training folds)
+    #By default gap=0, since we want to forecast immediately following timepoint
+
+
+    library(forecast)
+
+    # function to calculate cross-validated squared error
+    cv_forecasts <- function(fold, data) {
+      # Get training and validation data
+      train_data <- training(data)
+      valid_data <- validation(data)
+      valid_size <- length(valid_data)
+
+      train_ts <- ts(log10(train_data), frequency = 12)
+
+      # First arima model
+      arima_fit <- arima(train_ts, c(0, 1, 1),
+        seasonal = list(
+          order = c(0, 1, 1),
+          period = 12
+        )
+      )
+      raw_arima_pred <- predict(arima_fit, n.ahead = valid_size)
+      arima_pred <- 10^raw_arima_pred$pred
+      arima_MSE <- mean((arima_pred - valid_data)^2)
+
+      # Second arima model
+      arima_fit2 <- arima(train_ts, c(5, 1, 1),
+        seasonal = list(
+          order = c(0, 1, 1),
+          period = 12
+        )
+      )
+      raw_arima_pred2 <- predict(arima_fit2, n.ahead = valid_size)
+      arima_pred2 <- 10^raw_arima_pred2$pred
+      arima_MSE2 <- mean((arima_pred2 - valid_data)^2)
+
+      out <- list(mse = data.frame(
+        fold = fold_index(),
+        arima = arima_MSE, arima2 = arima_MSE2
+      ))
+      return(out)
+    }
+
+
+    ```
+
+## SuperLearner in Time Series Analysis
