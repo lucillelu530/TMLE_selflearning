@@ -537,6 +537,8 @@ mses$mse
 
 ## Parallel Processing in sl3
 
+SuperLearner also supports running across multiple computers at a time, called "multi-node" or "cluster" computing. See examples in `?SuperLearner` using `snowSuperLearner()`, and stay tuned for a future training on highly parallel SuperLearning; h2o.ai will also cover this.
+
 Using `future` Package, dont need to modify any code in order switch from sequential on the local machine to distributed processing on a remote compute cluster. And global variables and functions are automatically identified and exported as needed, making it straightforward to tweak existing code to make use of futures.”
 
 Example:
